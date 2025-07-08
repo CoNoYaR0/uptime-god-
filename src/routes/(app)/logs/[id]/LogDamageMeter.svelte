@@ -32,6 +32,7 @@
   import LogSkillDetails from "./LogSkillDetails.svelte";
   import OpenerSkills from "./OpenerSkills.svelte";
   import UptimeDisplay from "$lib/components/UptimeDisplay.svelte";
+  import { SUPPORT_CLASS_IDS } from "$lib/constants/classes";
 
   let { encounter }: { encounter: Encounter } = $props();
 
@@ -52,8 +53,15 @@
 
   function inspectPlayer(name: string) {
     meterState = MeterState.PLAYER;
-    chartType = ChartType.SKILL_LOG;
     playerName = name;
+    const inspectedPlayer = encounter.entities[name];
+    if (inspectedPlayer && SUPPORT_CLASS_IDS.has(inspectedPlayer.classId)) {
+      tab = MeterTab.UPTIME;
+      chartType = ChartType.SKILL_LOG; // Or a new chart type for supports
+    } else {
+      tab = MeterTab.DAMAGE;
+      chartType = ChartType.SKILL_LOG;
+    }
     scrollToTop();
   }
 

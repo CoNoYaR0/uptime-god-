@@ -116,3 +116,9 @@ export const AP: Record<APTypes, [string, string]> = {
   enlightenment: ["Enlightenment", "text-sky-300"],
   leap: ["Leap", "text-lime-300"]
 };
+
+export const SUPPORT_CLASS_IDS: Set<number> = new Set([
+  classNameToClassId["Bard"],
+  classNameToClassId["Paladin"],
+  classNameToClassId["Artist"],
+]);
