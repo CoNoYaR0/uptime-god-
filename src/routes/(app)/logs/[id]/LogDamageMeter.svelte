@@ -31,6 +31,7 @@
   import LogShields from "./LogShields.svelte";
   import LogSkillDetails from "./LogSkillDetails.svelte";
   import OpenerSkills from "./OpenerSkills.svelte";
+  import UptimeDisplay from "$lib/components/UptimeDisplay.svelte";
 
   let { encounter }: { encounter: Encounter } = $props();
 
@@ -231,6 +232,9 @@
         {@render logTab(MeterTab.BOSS, "Bosses")}
         <LogQuickControls bind:encounter {screenshotDiv} />
         <LogQuickSettings />
+        {#if meterState === MeterState.PLAYER && player}
+          {@render logTab(MeterTab.UPTIME, "Uptime")}
+        {/if}
       </div>
       <!-- screenshot info -->
       <LogScreenshotInfo {encounter} />
@@ -265,6 +269,8 @@
           {:else}
             <BossBreakdown {enc} boss={encounter.entities[focusedBoss]} handleRightClick={() => (focusedBoss = "")} />
           {/if}
+        {:else if tab === MeterTab.UPTIME && player}
+          <UptimeDisplay focusedPlayer={player} />
         {/if}
       </div>
     </div>

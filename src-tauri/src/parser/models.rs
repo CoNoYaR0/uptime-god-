@@ -260,12 +260,40 @@ pub struct DamageStats {
     pub rdps_damage_given: i64,
     #[serde(default)]
     pub incapacitations: Vec<IncapacitatedEvent>,
+
+    // Uptime Enhancer Fields
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub skill_uptimes: HashMap<u32, UptimeMetric>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub buff_uptimes: HashMap<u32, UptimeMetric>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub debuff_uptimes_on_boss: HashMap<u32, UptimeMetric>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UptimeMetric {
+    pub total_active_time_ms: i64,
+    pub fight_duration_ms: i64,
+    pub uptime_percentage: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<UptimeInstance>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UptimeInstance {
+    pub start_time: i64,
+    pub end_time: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillStats {
     pub casts: i64,
+    // Uptime Enhancer Fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_next_skill: Option<NextSkillRecommendation>,
     pub hits: i64,
     pub crits: i64,
     pub back_attacks: i64,
@@ -685,6 +713,14 @@ pub enum HitFlag {
     DAMAGE_SHARE,
     DODGE_HIT,
     MAX,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NextSkillRecommendation {
+    pub skill_id: u32,
+    pub reason: String,
+    // pub confidence: Option<f32>, // Optional: if we add confidence scores
 }
 
 lazy_static! {

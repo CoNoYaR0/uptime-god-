@@ -221,11 +221,32 @@ export interface DamageStats {
   rdpsDamageReceivedSupport: number;
   rdpsDamageGiven: number;
   incapacitations: IncapacitatedEvent[];
+  skillUptimes?: Record<string, UptimeMetric>;
+  buffUptimes?: Record<string, UptimeMetric>;
+  debuffUptimesOnBoss?: Record<string, UptimeMetric>;
   [key: string]: any;
+}
+
+export interface UptimeMetric {
+  totalActiveTimeMs: number;
+  fightDurationMs: number;
+  uptimePercentage: number;
+  instances: UptimeInstance[];
+}
+
+export interface UptimeInstance {
+  startTime: number;
+  endTime: number;
+}
+
+export interface NextSkillRecommendation {
+  skillId: number;
+  reason: string;
 }
 
 export interface SkillStats {
   casts: number;
+  recommendedNextSkill?: NextSkillRecommendation;
   hits: number;
   crits: number;
   backAttacks: number;
@@ -360,7 +381,8 @@ export enum MeterTab {
   STAGGER,
   DETAILS,
   BOSS,
-  SHIELDS
+  SHIELDS,
+  UPTIME
 }
 
 export enum ChartType {
