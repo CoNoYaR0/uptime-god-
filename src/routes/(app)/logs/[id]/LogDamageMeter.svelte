@@ -39,7 +39,7 @@
   let enc = $derived(new EncounterState(encounter, false));
 
   let meterState = $state(MeterState.PARTY);
-  let tab = $state(MeterTab.DAMAGE);
+  let tab = $state(MeterTab.DAMAGE); // Default fallback
   let chartType = $state(ChartType.AVERAGE_DPS);
 
   let playerName = $state("");
@@ -50,6 +50,28 @@
   });
 
   let focusedBoss = $state("");
+
+  let localPlayerEntity: Entity | undefined = $derived(encounter.entities[encounter.localPlayer]);
+  let isLocalPlayerSupport: boolean = $derived(
+    localPlayerEntity ? SUPPORT_CLASS_IDS.has(localPlayerEntity.classId) : false
+  );
+
+  // Effect to set initial default tab for party view or when encounter changes
+  $effect(() => {
+    if (encounter && localPlayerEntity && meterState === MeterState.PARTY) {
+      // This check ensures we only set the default if not already focused on a player specific tab
+      // and the encounter data is available.
+      if (isLocalPlayerSupport) {
+        // Check if UPTIME tab is viable (e.g. local player is the one with uptime data)
+        // For now, we assume if they are support, UPTIME tab is always relevant for them.
+        tab = MeterTab.UPTIME;
+      } else {
+        tab = MeterTab.DAMAGE;
+      }
+      // Set a default chart for party view too
+      chartType = ChartType.AVERAGE_DPS;
+    }
+  });
 
   function inspectPlayer(name: string) {
     meterState = MeterState.PLAYER;
@@ -166,7 +188,13 @@
       meterState = MeterState.PARTY;
       playerName = "";
       focusedBoss = "";
-      chartType = ChartType.AVERAGE_DPS;
+      // Reset tab based on local player role when returning to party view
+      if (isLocalPlayerSupport) {
+        tab = MeterTab.UPTIME;
+      } else {
+        tab = MeterTab.DAMAGE;
+      }
+      chartType = ChartType.AVERAGE_DPS; // Default chart for party view
       scrollToTop();
     }
   }
