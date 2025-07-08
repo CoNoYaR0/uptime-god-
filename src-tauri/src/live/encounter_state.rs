@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hashbrown::HashMap;
 use log::{info, warn};
 use meter_core::packets::common::SkillMoveOptionData;
@@ -49,39 +49,43 @@ pub struct EncounterState {
     custom_id_map: HashMap<u32, u32>,
 
     pub damage_is_valid: bool,
+
+    // Uptime Enhancer State
+    active_buffs: HashMap<(u64, u32), ActiveUptimeInstance>, // (target_id, effect_id_or_skill_id) -> ActiveUptimeInstance
+    active_debuffs_on_boss: HashMap<(u64, u32), ActiveUptimeInstance>, // (boss_target_id, effect_id) -> ActiveUptimeInstance
+}
+
+#[derive(Debug, Clone)]
+struct ActiveUptimeInstance {
+    start_time_ms: i64,
+    source_entity_name: String, // Name of the player who applied the buff/debuff
 }
 
 impl EncounterState {
-    pub fn new(window: AppHandle) -> EncounterState {
+    pub fn new(app: AppHandle) -> EncounterState {
         EncounterState {
-            app: window,
+            app,
             encounter: Encounter::default(),
             resetting: false,
             raid_clear: false,
             boss_dead_update: false,
             saved: false,
-
             damage_log: HashMap::new(),
             boss_hp_log: HashMap::new(),
             cast_log: HashMap::new(),
-
             party_info: Vec::new(),
-            raid_difficulty: "".to_string(),
+            raid_difficulty: String::new(),
             raid_difficulty_id: 0,
             boss_only_damage: false,
             region: None,
-
             sntp_client: SntpClient::new(),
             ntp_fight_start: 0,
-
-            // todo
             rdps_valid: false,
-
             skill_tracker: SkillTracker::new(),
-
             custom_id_map: HashMap::new(),
-
             damage_is_valid: true,
+            active_buffs: HashMap::new(),
+            active_debuffs_on_boss: HashMap::new(),
         }
     }
 
@@ -106,8 +110,9 @@ impl EncounterState {
         self.rdps_valid = false;
 
         self.skill_tracker = SkillTracker::new();
-
         self.custom_id_map = HashMap::new();
+        self.active_buffs.clear();
+        self.active_debuffs_on_boss.clear();
 
         for (key, entity) in clone.entities.into_iter().filter(|(_, e)| {
             e.entity_type == EntityType::PLAYER
@@ -168,7 +173,8 @@ impl EncounterState {
 
     pub fn on_init_env(&mut self, entity: Entity, stats_api: &StatsApi) {
         // if not already saved to db, we save again
-        if !self.saved && !self.encounter.current_boss_name.is_empty() {
+        if !self.saved && !self.encounter.current_boss_name.is_empty() && self.encounter.fight_start > 0 {
+            self.finalize_and_save_uptimes(Utc::now().timestamp_millis());
             self.save_to_db(stats_api, false);
         }
 
@@ -204,10 +210,11 @@ impl EncounterState {
 
         match phase_code {
             0 | 2 | 3 | 4 => {
-                if !self.encounter.current_boss_name.is_empty() {
+                if !self.encounter.current_boss_name.is_empty() && self.encounter.fight_start > 0 {
                     if phase_code == 0 {
                         stats_api.valid_zone = false;
                     }
+                    self.finalize_and_save_uptimes(Utc::now().timestamp_millis());
                     self.save_to_db(stats_api, false);
                     self.saved = true;
                 }
@@ -216,6 +223,69 @@ impl EncounterState {
             _ => (),
         }
     }
+
+    fn finalize_and_save_uptimes(&mut self, end_timestamp_ms: i64) {
+        if self.encounter.fight_start == 0 {
+            return;
+        }
+
+        let fight_duration_ms = end_timestamp_ms - self.encounter.fight_start;
+        if fight_duration_ms <= 0 {
+            return;
+        }
+
+        // Finalize active buffs
+        let active_buffs_clone = self.active_buffs.clone();
+        for ((target_id, effect_id), active_instance) in active_buffs_clone.iter() {
+            if let Some(source_player) = self.encounter.entities.get_mut(&active_instance.source_entity_name) {
+                let uptime_metric = source_player.damage_stats.buff_uptimes.entry(*effect_id).or_insert_with(|| UptimeMetric {
+                    fight_duration_ms,
+                    ..Default::default()
+                });
+                uptime_metric.instances.push(UptimeInstance {
+                    start_time: active_instance.start_time_ms,
+                    end_time: end_timestamp_ms,
+                });
+                uptime_metric.total_active_time_ms += end_timestamp_ms - active_instance.start_time_ms;
+            }
+        }
+        self.active_buffs.clear();
+
+        // Finalize active debuffs on boss
+        let active_debuffs_clone = self.active_debuffs_on_boss.clone();
+        for ((_boss_id, effect_id), active_instance) in active_debuffs_clone.iter() {
+             if let Some(source_player) = self.encounter.entities.get_mut(&active_instance.source_entity_name) {
+                let uptime_metric = source_player.damage_stats.debuff_uptimes_on_boss.entry(*effect_id).or_insert_with(|| UptimeMetric {
+                    fight_duration_ms,
+                    ..Default::default()
+                });
+                uptime_metric.instances.push(UptimeInstance {
+                    start_time: active_instance.start_time_ms,
+                    end_time: end_timestamp_ms,
+                });
+                uptime_metric.total_active_time_ms += end_timestamp_ms - active_instance.start_time_ms;
+            }
+        }
+        self.active_debuffs_on_boss.clear();
+
+        // Calculate percentages
+        for player_entity in self.encounter.entities.values_mut() {
+            if player_entity.entity_type == EntityType::PLAYER {
+                for uptime_metric in player_entity.damage_stats.buff_uptimes.values_mut() {
+                    if uptime_metric.fight_duration_ms > 0 {
+                        uptime_metric.uptime_percentage = (uptime_metric.total_active_time_ms as f32 / uptime_metric.fight_duration_ms as f32) * 100.0;
+                    }
+                }
+                for uptime_metric in player_entity.damage_stats.debuff_uptimes_on_boss.values_mut() {
+                     if uptime_metric.fight_duration_ms > 0 {
+                        uptime_metric.uptime_percentage = (uptime_metric.total_active_time_ms as f32 / uptime_metric.fight_duration_ms as f32) * 100.0;
+                    }
+                }
+                // TODO: Skill uptimes if we decide to track them this way (e.g. for channeled skills)
+            }
+        }
+    }
+
 
     // replace local player
     pub fn on_init_pc(&mut self, entity: Entity, hp: i64, max_hp: i64) {
@@ -349,56 +419,52 @@ impl EncounterState {
         }
         let skill_name = get_skill_name(&skill_id);
         let mut tripod_change = false;
-        let entity = self
+        let original_skill_id = skill_id; // Keep original for uptime tracking if needed
+
+        let encounter_entity = self
             .encounter
             .entities
             .entry(source_entity.name.clone())
             .or_insert_with(|| {
-                let (skill_name, skill_icon, summons) = get_skill_name_and_icon(
-                    &skill_id,
+                let (s_name, s_icon, s_summons) = get_skill_name_and_icon(
+                    &original_skill_id,
                     &0,
-                    skill_name.clone(),
+                    get_skill_name(&original_skill_id),
                     &self.skill_tracker,
                     source_entity.id,
                 );
-                let mut entity = encounter_entity_from_entity(source_entity);
-                entity.skill_stats = SkillStats {
+                let mut new_entity = encounter_entity_from_entity(source_entity);
+                new_entity.skill_stats = SkillStats {
                     casts: 0,
                     ..Default::default()
                 };
-                entity.skills = HashMap::from([(
-                    skill_id,
+                new_entity.skills = HashMap::from([(
+                    original_skill_id,
                     Skill {
-                        id: skill_id,
-                        name: {
-                            if skill_name.is_empty() {
-                                skill_id.to_string()
-                            } else {
-                                skill_name
-                            }
-                        },
-                        icon: skill_icon,
+                        id: original_skill_id,
+                        name: if s_name.is_empty() { original_skill_id.to_string() } else { s_name },
+                        icon: s_icon,
                         tripod_index,
                         tripod_level,
-                        summon_sources: summons,
+                        summon_sources: s_summons,
                         casts: 0,
                         ..Default::default()
                     },
                 )]);
                 tripod_change = true;
-                entity
+                new_entity
             });
 
-        if entity.class_id == 0
+        if encounter_entity.class_id == 0
             && source_entity.entity_type == EntityType::PLAYER
             && source_entity.class_id > 0
         {
-            entity.class_id = source_entity.class_id;
-            entity.class = get_class_from_id(&source_entity.class_id);
+            encounter_entity.class_id = source_entity.class_id;
+            encounter_entity.class = get_class_from_id(&source_entity.class_id);
         }
 
-        entity.is_dead = false;
-        entity.skill_stats.casts += 1;
+        encounter_entity.is_dead = false;
+        encounter_entity.skill_stats.casts += 1;
 
         let relative_timestamp = if self.encounter.fight_start == 0 {
             0
@@ -406,105 +472,65 @@ impl EncounterState {
             (timestamp - self.encounter.fight_start) as i32
         };
 
-        // if skills have different ids but the same name, we group them together
-        // dunno if this is right approach xd
-        let mut skill_id = skill_id;
+        let mut current_skill_id = original_skill_id;
         let mut skill_summon_sources: Option<Vec<u32>> = None;
-        if let Some(skill) = entity.skills.get_mut(&skill_id) {
-            skill.casts += 1;
-            tripod_change = check_tripod_index_change(skill.tripod_index, tripod_index)
-                || check_tripod_level_change(skill.tripod_level, tripod_level);
-            skill.tripod_index = tripod_index;
-            skill.tripod_level = tripod_level;
-            skill_summon_sources.clone_from(&skill.summon_sources);
-        } else if let Some(skill) = entity
+
+        if let Some(skill_entry) = encounter_entity.skills.get_mut(&current_skill_id) {
+            skill_entry.casts += 1;
+            tripod_change = check_tripod_index_change(skill_entry.tripod_index, tripod_index)
+                || check_tripod_level_change(skill_entry.tripod_level, tripod_level);
+            skill_entry.tripod_index = tripod_index;
+            skill_entry.tripod_level = tripod_level;
+            skill_summon_sources.clone_from(&skill_entry.summon_sources);
+        } else if let Some(existing_skill_by_name) = encounter_entity
             .skills
             .values_mut()
-            .find(|s| s.name == skill_name.clone())
+            .find(|s| s.name == skill_name)
         {
-            skill.casts += 1;
-            skill_id = skill.id;
-            tripod_change = check_tripod_index_change(skill.tripod_index, tripod_index)
-                || check_tripod_level_change(skill.tripod_level, tripod_level);
-            skill.tripod_index = tripod_index;
-            skill.tripod_level = tripod_level;
-            skill_summon_sources.clone_from(&skill.summon_sources);
+            existing_skill_by_name.casts += 1;
+            current_skill_id = existing_skill_by_name.id;
+            tripod_change = check_tripod_index_change(existing_skill_by_name.tripod_index, tripod_index)
+                || check_tripod_level_change(existing_skill_by_name.tripod_level, tripod_level);
+            existing_skill_by_name.tripod_index = tripod_index;
+            existing_skill_by_name.tripod_level = tripod_level;
+            skill_summon_sources.clone_from(&existing_skill_by_name.summon_sources);
         } else {
-            let (skill_name, skill_icon, summons) = get_skill_name_and_icon(
-                &skill_id,
+            let (s_name, s_icon, s_summons) = get_skill_name_and_icon(
+                &original_skill_id,
                 &0,
                 skill_name.clone(),
                 &self.skill_tracker,
                 source_entity.id,
             );
-            skill_summon_sources.clone_from(&summons);
-            entity.skills.insert(
-                skill_id,
+            skill_summon_sources.clone_from(&s_summons);
+            encounter_entity.skills.insert(
+                original_skill_id,
                 Skill {
-                    id: skill_id,
-                    name: {
-                        if skill_name.is_empty() {
-                            skill_id.to_string()
-                        } else {
-                            skill_name
-                        }
-                    },
-                    icon: skill_icon,
+                    id: original_skill_id,
+                    name: if s_name.is_empty() { original_skill_id.to_string() } else { s_name },
+                    icon: s_icon,
                     tripod_index,
                     tripod_level,
-                    summon_sources: summons,
+                    summon_sources: s_summons,
                     casts: 1,
                     ..Default::default()
                 },
             );
             tripod_change = true;
         }
-        if tripod_change {
-            if let (Some(tripod_index), Some(_tripod_level)) = (tripod_index, tripod_level) {
-                let mut indexes = vec![tripod_index.first];
-                if tripod_index.second != 0 {
-                    indexes.push(tripod_index.second + 3);
-                }
-                // third row should never be set if second is not set
-                if tripod_index.third != 0 {
-                    indexes.push(tripod_index.third + 6);
-                }
-                // let levels = [tripod_level.first, tripod_level.second, tripod_level.third];
-                // if let Some(effect) = SKILL_FEATURE_DATA.get(&skill_id) {
-                //     for i in 0..indexes.len() {
-                //         if let Some(entries) = effect.tripods.get(&indexes[i]) {
-                //             let mut options: Vec<SkillFeatureOption> = vec![];
-                //             for entry in &entries.entries {
-                //                 if entry.level > 0 && entry.level == levels[i] {
-                //                     options.push(entry.clone());
-                //                 }
-                //             }
-                //             tripod_data.push(TripodData {
-                //                 index: indexes[i],
-                //                 options,
-                //             });
-                //         }
-                //     }
-                // }
-            }
 
-            // if !tripod_data.is_empty() {
-            //     entity.skills.entry(skill_id).and_modify(|e| {
-            //         e.tripod_data = Some(tripod_data);
-            //     });
-            // }
-        }
+        // TODO: Handle tripod_change logic if necessary for uptime features
+
         self.cast_log
-            .entry(entity.name.clone())
+            .entry(encounter_entity.name.clone())
             .or_default()
-            .entry(skill_id)
+            .entry(current_skill_id)
             .or_default()
             .push(relative_timestamp);
 
-        // if this is a getup skill and we have an ongoing abnormal move incapacitation, this will end it
-        if let Some(skill_data) = SKILL_DATA.get(&skill_id) {
+        if let Some(skill_data) = SKILL_DATA.get(&current_skill_id) {
             if skill_data.skill_type == "getup" {
-                for ongoing_event in entity
+                 for ongoing_event in encounter_entity
                     .damage_stats
                     .incapacitations
                     .iter_mut()
@@ -522,8 +548,38 @@ impl EncounterState {
             }
         }
 
-        (skill_id, skill_summon_sources)
+        // Placeholder for next skill recommendation
+        self.update_next_skill_recommendation(encounter_entity.name.clone());
+
+        (current_skill_id, skill_summon_sources)
     }
+
+    fn update_next_skill_recommendation(&mut self, player_name: String) {
+        // This is a placeholder for the actual recommendation logic
+        // It will need to consider cooldowns, current buffs, optimal rotation, etc.
+        if let Some(player_entity) = self.encounter.entities.get_mut(&player_name) {
+            // Example: Simple recommendation for Bard - this will be expanded in a later step
+            if player_entity.class.as_str() == "Bard" {
+                 // Let's simulate recommending Sound Shock if Mark is down (needs actual Mark tracking)
+                let sound_shock_id = tärkeät_skillit_bard().get("Sound Shock").cloned().unwrap_or(0);
+                let heavenly_tune_id = tärkeät_skillit_bard().get("Heavenly Tune").cloned().unwrap_or(0);
+
+                // Simple logic: alternate between two skills for now for testing payload
+                if player_entity.skill_stats.casts % 2 == 0 {
+                    player_entity.skill_stats.recommended_next_skill = Some(NextSkillRecommendation {
+                        skill_id: sound_shock_id,
+                        reason: "Maintain Mark Debuff (Placeholder)".to_string(),
+                    });
+                } else {
+                    player_entity.skill_stats.recommended_next_skill = Some(NextSkillRecommendation {
+                        skill_id: heavenly_tune_id,
+                        reason: "Maintain Attack Power Buff (Placeholder)".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
 
     #[allow(clippy::too_many_arguments)]
     pub fn on_damage(
@@ -1287,6 +1343,84 @@ impl EncounterState {
     //     }
     // }
 
+    pub fn on_status_effect_add(
+        &mut self,
+        status_effect: &StatusEffectDetails,
+        target_entity: &Entity, // The entity receiving the buff/debuff
+        source_entity_name: String, // Name of the player entity that sourced this effect
+    ) {
+        if self.encounter.fight_start == 0 {
+            return;
+        }
+        let current_time_ms = Utc::now().timestamp_millis();
+        let effect_key = (target_entity.id, status_effect.status_effect_id);
+
+        if target_entity.entity_type == EntityType::PLAYER || target_entity.name == self.encounter.local_player {
+            // It's a buff on a player
+            if !self.active_buffs.contains_key(&effect_key) {
+                self.active_buffs.insert(
+                    effect_key,
+                    ActiveUptimeInstance { start_time_ms: current_time_ms, source_entity_name },
+                );
+            }
+        } else if target_entity.entity_type == EntityType::BOSS && target_entity.name == self.encounter.current_boss_name {
+            // It's a debuff on the current boss
+            let debuff_key = (target_entity.id, status_effect.status_effect_id);
+             if !self.active_debuffs_on_boss.contains_key(&debuff_key) {
+                self.active_debuffs_on_boss.insert(
+                    debuff_key,
+                    ActiveUptimeInstance { start_time_ms: current_time_ms, source_entity_name },
+                );
+            }
+        }
+    }
+
+    pub fn on_status_effect_remove(
+        &mut self,
+        status_effect_id: u32,
+        target_id: u64, // ID of the entity the effect was removed from
+        target_is_boss: bool,
+    ) {
+        if self.encounter.fight_start == 0 {
+            return;
+        }
+        let current_time_ms = Utc::now().timestamp_millis();
+        let effect_key = (target_id, status_effect_id);
+
+        let active_map = if target_is_boss {
+            &mut self.active_debuffs_on_boss
+        } else {
+            &mut self.active_buffs
+        };
+
+        if let Some(active_instance) = active_map.remove(&effect_key) {
+            if let Some(source_player) = self.encounter.entities.get_mut(&active_instance.source_entity_name) {
+                let fight_duration_ms = current_time_ms - self.encounter.fight_start;
+                let uptime_map = if target_is_boss {
+                    &mut source_player.damage_stats.debuff_uptimes_on_boss
+                } else {
+                    &mut source_player.damage_stats.buff_uptimes
+                };
+
+                let uptime_metric = uptime_map.entry(status_effect_id).or_insert_with(|| UptimeMetric {
+                    fight_duration_ms: if fight_duration_ms > 0 { fight_duration_ms } else { 0 }, // Avoid division by zero later
+                    ..Default::default()
+                });
+
+                let duration = current_time_ms - active_instance.start_time_ms;
+                if duration > 0 {
+                    uptime_metric.instances.push(UptimeInstance {
+                        start_time: active_instance.start_time_ms,
+                        end_time: current_time_ms,
+                    });
+                    uptime_metric.total_active_time_ms += duration;
+                    // Percentage will be calculated at the end or on demand
+                }
+            }
+        }
+    }
+
+
     pub fn on_boss_shield(&mut self, target_entity: &Entity, shield: u64) {
         if target_entity.entity_type == EntityType::BOSS
             && target_entity.name == self.encounter.current_boss_name
@@ -1470,6 +1604,59 @@ impl EncounterState {
         }
     }
 
+    // pub fn update_next_skill_recommendation(&mut self, player_name: String) {
+    //     // This is a placeholder for the actual recommendation logic
+    //     // It will need to consider cooldowns, current buffs, optimal rotation, etc.
+    //     if let Some(player_entity) = self.encounter.entities.get_mut(&player_name) {
+    //         if player_entity.class_id == classNameToClassId["Bard"] { // Example for Bard
+    //             // Simple placeholder: recommend sound shock if not recently used, else heavenly tune
+    //             let sound_shock_id = 21020;
+    //             let heavenly_tune_id = 21160;
+    //             // Check last cast time of sound shock (needs more sophisticated tracking)
+    //             let recommend_sound_shock = true; // Placeholder
+    //
+    //             if recommend_sound_shock {
+    //                 player_entity.skill_stats.recommended_next_skill = Some(NextSkillRecommendation {
+    //                     skill_id: sound_shock_id,
+    //                     reason: "Maintain Mark Debuff".to_string(),
+    //                 });
+    //             } else {
+    //                 player_entity.skill_stats.recommended_next_skill = Some(NextSkillRecommendation {
+    //                     skill_id: heavenly_tune_id,
+    //                     reason: "Maintain Attack Power Buff".to_string(),
+    //                 });
+    //             }
+    //         }
+    //     }
+    // }
+
+    // Helper function to get key skill IDs for Bard (can be expanded for other classes)
+struct BardSkillInfo {
+    id: u32,
+    cooldown_ms: i64,
+    // For buffs/debuffs, this would be the StatusEffectId they apply
+    // This needs to be looked up from SKILL_BUFF_DATA.json based on the skill.
+    // Example: Sound Shock applies effect ID 210201 (Stigma)
+    applies_effect_id: Option<u32>,
+}
+
+fn tärkeät_skillit_bard() -> HashMap<String, BardSkillInfo> {
+    let mut skills = HashMap::new();
+    // Placeholder IDs and Cooldowns - These MUST be verified with game data / Skill.json / SkillBuff.json
+    // Cooldowns are in milliseconds.
+    // Applied effect IDs are also placeholders and need verification.
+    skills.insert("Sound Shock".to_string(), BardSkillInfo { id: 21020, cooldown_ms: 6000, applies_effect_id: Some(210201) }); // Stigma effect ID
+    skills.insert("Heavenly Tune".to_string(), BardSkillInfo { id: 21160, cooldown_ms: 30000, applies_effect_id: Some(211601) }); // Heavenly Tune buff effect ID
+    skills.insert("Sonic Vibration".to_string(), BardSkillInfo { id: 21170, cooldown_ms: 24000, applies_effect_id: Some(211701) }); // Sonic Vibration buff effect ID
+    skills.insert("Guardian Tune".to_string(), BardSkillInfo { id: 21110, cooldown_ms: 30000, applies_effect_id: Some(211101) }); // Guardian Tune DR buff
+    skills.insert("Wind of Music".to_string(), BardSkillInfo { id: 21070, cooldown_ms: 18000, applies_effect_id: Some(210701) }); // Wind of Music shield buff
+    skills.insert("Serenade of Courage".to_string(), BardSkillInfo { id: 21140, cooldown_ms: 1000, applies_effect_id: Some(211401) }); // Serenade buff (CD is nominal, depends on meter)
+    // Note: Serenade ID might change based on bubble count (e.g. 21141, 21142 for 2, 3 bubbles)
+    // This simple map doesn't account for that yet.
+    skills
+}
+
+
     pub fn save_to_db(&mut self, stats_api: &StatsApi, manual: bool) {
         if !manual
             && (self.encounter.fight_start == 0
@@ -1488,7 +1675,20 @@ impl EncounterState {
 
         if !self.damage_is_valid {
             warn!("damage decryption is invalid, not saving to db");
+            // Even if damage is invalid, we might still want to save uptime data if the fight started.
+            // However, fight_duration_ms might be 0 if fight_start was never set due to no valid damage.
+            if self.encounter.fight_start > 0 {
+                 self.finalize_and_save_uptimes(Utc::now().timestamp_millis());
+            } else {
+                return; // No fight start, no point in saving.
+            }
+        } else {
+            // Finalize uptimes before saving if damage is valid and fight has started
+            if self.encounter.fight_start > 0 {
+                self.finalize_and_save_uptimes(Utc::now().timestamp_millis());
+            }
         }
+
 
         let mut encounter = self.encounter.clone();
         let mut path = self

@@ -655,29 +655,28 @@ pub fn start(app: AppHandle, port: u16, settings: Option<Settings>) -> Result<()
                     PKTPartyStatusEffectAddNotify::new,
                     "PKTPartyStatusEffectAddNotify",
                 ) {
-                    // info!("{:?}", pkt);
-                    let shields =
+                    let effects =
                         entity_tracker.party_status_effect_add(pkt, &state.encounter.entities);
-                    for status_effect in shields {
-                        let source = entity_tracker.get_source_entity(status_effect.source_id);
-                        let target_id =
-                            if status_effect.target_type == StatusEffectTargetType::Party {
-                                id_tracker
-                                    .borrow()
-                                    .get_entity_id(status_effect.target_id)
-                                    .unwrap_or_default()
-                            } else {
-                                status_effect.target_id
-                            };
-                        let target = entity_tracker.get_source_entity(target_id);
-                        // info!("SHIELD SOURCE: {} > TARGET: {}", source.name, target.name);
-                        state.on_boss_shield(&target, status_effect.value);
-                        state.on_shield_applied(
-                            &source,
-                            &target,
-                            status_effect.status_effect_id,
-                            status_effect.value,
-                        );
+                    for status_effect_details in effects {
+                        let source_entity = entity_tracker.get_source_entity(status_effect_details.source_id);
+                        let target_id = if status_effect_details.target_type == StatusEffectTargetType::Party {
+                            id_tracker.borrow().get_entity_id(status_effect_details.target_id).unwrap_or_default()
+                        } else {
+                            status_effect_details.target_id
+                        };
+                        let target_entity = entity_tracker.get_source_entity(target_id);
+
+                        if status_effect_details.status_effect_type == StatusEffectType::Shield {
+                            state.on_boss_shield(&target_entity, status_effect_details.value);
+                            state.on_shield_applied(
+                                &source_entity,
+                                &target_entity,
+                                status_effect_details.status_effect_id,
+                                status_effect_details.value,
+                            );
+                        }
+                        // Call generalized on_status_effect_add for uptime tracking
+                        state.on_status_effect_add(&status_effect_details, &target_entity, source_entity.name.clone());
                     }
                 }
             }
@@ -687,16 +686,28 @@ pub fn start(app: AppHandle, port: u16, settings: Option<Settings>) -> Result<()
                     PKTPartyStatusEffectRemoveNotify::new,
                     "PKTPartyStatusEffectRemoveNotify",
                 ) {
-                    let (is_shield, shields_broken, _effects_removed, _left_workshop) =
+                    let (is_shield, shields_broken, effects_removed, _left_workshop) =
                         entity_tracker.party_status_effect_remove(pkt);
+
+                    for status_effect_details in effects_removed {
+                        let target_id = if status_effect_details.target_type == StatusEffectTargetType::Party {
+                            id_tracker.borrow().get_entity_id(status_effect_details.target_id).unwrap_or_default()
+                        } else {
+                            status_effect_details.target_id
+                        };
+                         let target_entity = entity_tracker.get_source_entity(target_id);
+                        // Call generalized on_status_effect_remove for uptime tracking
+                        state.on_status_effect_remove(status_effect_details.status_effect_id, target_id, target_entity.entity_type == EntityType::BOSS);
+                    }
+
                     if is_shield {
-                        for status_effect in shields_broken {
-                            let change = status_effect.value;
+                        for status_effect_details in shields_broken {
+                            let change = status_effect_details.value;
                             on_shield_change(
                                 &mut entity_tracker,
                                 &id_tracker,
                                 &mut state,
-                                status_effect,
+                                status_effect_details,
                                 change,
                             );
                         }
@@ -732,31 +743,25 @@ pub fn start(app: AppHandle, port: u16, settings: Option<Settings>) -> Result<()
                         Some(&state.encounter.entities),
                     );
 
-                    if status_effect.status_effect_type == StatusEffectType::Shield {
-                        let source = entity_tracker.get_source_entity(status_effect.source_id);
-                        let target_id =
-                            if status_effect.target_type == StatusEffectTargetType::Party {
-                                id_tracker
-                                    .borrow()
-                                    .get_entity_id(status_effect.target_id)
-                                    .unwrap_or_default()
-                            } else {
-                                status_effect.target_id
-                            };
-                        let target = entity_tracker.get_source_entity(target_id);
-                        state.on_boss_shield(&target, status_effect.value);
+                    let source_entity = entity_tracker.get_source_entity(status_effect_details.source_id);
+                    let target_entity = entity_tracker.get_source_entity(status_effect_details.target_id);
+
+                    if status_effect_details.status_effect_type == StatusEffectType::Shield {
+                        state.on_boss_shield(&target_entity, status_effect_details.value);
                         state.on_shield_applied(
-                            &source,
-                            &target,
-                            status_effect.status_effect_id,
-                            status_effect.value,
+                            &source_entity,
+                            &target_entity,
+                            status_effect_details.status_effect_id,
+                            status_effect_details.value,
                         );
                     }
+                     // Call generalized on_status_effect_add for uptime tracking
+                    state.on_status_effect_add(&status_effect_details, &target_entity, source_entity.name.clone());
 
-                    if status_effect.status_effect_type == StatusEffectType::HardCrowdControl {
-                        let target = entity_tracker.get_source_entity(status_effect.target_id);
-                        if target.entity_type == EntityType::PLAYER {
-                            state.on_cc_applied(&target, &status_effect);
+
+                    if status_effect_details.status_effect_type == StatusEffectType::HardCrowdControl {
+                        if target_entity.entity_type == EntityType::PLAYER {
+                            state.on_cc_applied(&target_entity, &status_effect_details);
                         }
                     }
                 }
@@ -788,29 +793,33 @@ pub fn start(app: AppHandle, port: u16, settings: Option<Settings>) -> Result<()
                             pkt.reason,
                             StatusEffectTargetType::Local,
                         );
+
+                    let current_time_ms = Utc::now().timestamp_millis();
+                    for effect_details in effects_removed {
+                        let target_entity = entity_tracker.get_source_entity(effect_details.target_id);
+                        state.on_status_effect_remove(effect_details.status_effect_id, effect_details.target_id, target_entity.entity_type == EntityType::BOSS);
+
+                        if effect_details.status_effect_type == StatusEffectType::HardCrowdControl {
+                            if target_entity.entity_type == EntityType::PLAYER {
+                                state.on_cc_removed(&target_entity, &effect_details, current_time_ms);
+                            }
+                        }
+                    }
+
                     if is_shield {
                         if shields_broken.is_empty() {
-                            let target = entity_tracker.get_source_entity(pkt.object_id);
-                            state.on_boss_shield(&target, 0);
+                            let target_entity = entity_tracker.get_source_entity(pkt.object_id);
+                            state.on_boss_shield(&target_entity, 0);
                         } else {
-                            for status_effect in shields_broken {
-                                let change = status_effect.value;
+                            for status_effect_details in shields_broken {
+                                let change = status_effect_details.value;
                                 on_shield_change(
                                     &mut entity_tracker,
                                     &id_tracker,
                                     &mut state,
-                                    status_effect,
+                                    status_effect_details,
                                     change,
                                 );
-                            }
-                        }
-                    }
-                    let now = Utc::now().timestamp_millis();
-                    for effect_removed in effects_removed {
-                        if effect_removed.status_effect_type == StatusEffectType::HardCrowdControl {
-                            let target = entity_tracker.get_source_entity(effect_removed.target_id);
-                            if target.entity_type == EntityType::PLAYER {
-                                state.on_cc_removed(&target, &effect_removed, now);
                             }
                         }
                     }
